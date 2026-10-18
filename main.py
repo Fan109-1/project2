@@ -266,8 +266,8 @@ def main():
 
     pipeline = build_pipeline(chunks_info=chunks_info,
                               use_reranker=True,
-                              use_query_planner=True,
-                              use_generator=False)
+                              use_query_planner=False,
+                              use_generator=True)
 
     while True:
         query = input("\n请输入问题，输入1退出：").strip()
@@ -278,12 +278,12 @@ def main():
             print("问题不能为空") 
             continue
 
-        result = pipeline.run_low(
+        result = pipeline.run(
             query=query,
-            per_retriever_k=20
+            per_retriever_k=20,
         )
 
-        print_low_results(result)
+        print_results(result)
 
 
 if __name__ == "__main__":

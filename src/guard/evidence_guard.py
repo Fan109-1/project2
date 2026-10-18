@@ -1,6 +1,6 @@
 # threshold临界点
 def select_evidence_chunks(retrieved_chunks: list[dict],
-                           threshold: float = 0.9,
+                           threshold: float = 0.7,
                            max_chunks: int = 5) -> list[dict]:
 
     evidence_chunks = []

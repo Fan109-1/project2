@@ -4,7 +4,10 @@ bm25retriever：先定义，初始化fit,RAGPipeline(retriever=bm25retriever)
 hybridretriever：用初始化后的vectorretriever，bm25retriever定义，
 RAGPipeline(retriever=hybridretriever,reranker)
 '''
-from src.prompt.rag_prompt import build_rag_prompt
+from src.prompt.rag_prompt import (
+    build_citation_sources,
+    build_single_evidence_prompt,
+)
 import math
 import re
 import statistics
@@ -994,83 +997,269 @@ class RAGPipeline:
 
 
 
-    def extract_used_citation(self,answer: str,citation_sources: list[dict]) -> list[dict]:
+    def extract_used_citation(
+        self,
+        answer: str,
+        citation_sources: list[dict]
+    ) -> list[dict]:
 
-        cited_labels = re.findall(r"\[资料\d+\]",answer)
+        cited_labels = re.findall(r"\[资料\d+\]", answer)
 
         # 去重，同时保持原出现顺序
         cited_labels = list(dict.fromkeys(cited_labels))
 
         used_citation = [
-            item for item in citation_sources
+            item
+            for item in citation_sources
             if item["citation_id"] in cited_labels
         ]
 
-        '''list[dict]
-        {
-            "citation_id": num_citation,
-            "chunk_id": chunk["id"],
-            "source": chunk["source"]
-        }'''
         return used_citation
 
 
-    def run(self,query:str,per_retriever_k:int=20)->dict:
+    def validate_answer_citations(
+        self,
+        answer: str,
+        citation_sources: list[dict]
+    ) -> bool:
+        """保证正式回答不是“有答案但没有来源”。
 
+        这里不做生成后事实核验，只检查输出格式：
+        - 标准拒答句允许没有 citation；
+        - 非拒答回答的每个非空行都必须至少包含一个有效 citation；
+        - citation 必须属于当前 Evidence。
+        """
+
+        refusal_answer = "根据当前提供的资料，无法确定。"
+
+        if answer.strip() == refusal_answer:
+            return True
+
+        valid_citation_ids = {
+            item["citation_id"]
+            for item in citation_sources
+        }
+
+        answer_lines = [
+            line.strip()
+            for line in answer.splitlines()
+            if line.strip()
+        ]
+
+        if not answer_lines:
+            return False
+
+        if len(answer_lines) > 3:
+            return False
+
+        for line in answer_lines:
+
+            citation_suffix_match = re.search(
+                r"((?:\[资料\d+\])+)$",
+                line
+            )
+
+            if citation_suffix_match is None:
+                return False
+
+            claim = line[:citation_suffix_match.start()].strip()
+
+            if not claim:
+                return False
+
+            if re.search(r"\[资料\d+\]", claim):
+                return False
+
+            line_citations = re.findall(
+                r"\[资料\d+\]",
+                citation_suffix_match.group(1)
+            )
+
+            if any(
+                citation_id not in valid_citation_ids
+                for citation_id in line_citations
+            ):
+                return False
+
+            chinese_character_count = len(
+                re.findall(r"[\u4e00-\u9fff]", claim)
+            )
+
+            if chinese_character_count > 60:
+                return False
+
+        return True
+
+
+    def parse_single_evidence_answer(
+        self,
+        raw_answer: str
+    ) -> str | None:
+        """解析单 Evidence 输出；NO_ANSWER 或格式不合格时返回 None。"""
+
+        normalized_answer = raw_answer.strip()
+
+        if normalized_answer == "NO_ANSWER":
+            return None
+
+        if "NO_ANSWER" in normalized_answer:
+            return None
+
+        if normalized_answer == "根据当前提供的资料，无法确定。":
+            return None
+
+        answer_lines = [
+            line.strip()
+            for line in normalized_answer.splitlines()
+            if line.strip()
+        ]
+
+        if len(answer_lines) != 1:
+            return None
+
+        conclusion = answer_lines[0]
+
+        if re.search(r"\[资料\d+\]", conclusion):
+            return None
+
+        chinese_character_count = len(
+            re.findall(r"[\u4e00-\u9fff]", conclusion)
+        )
+
+        if chinese_character_count > 60:
+            return None
+
+        return conclusion
+
+
+    def run(
+        self,
+        query: str,
+        per_retriever_k: int = 20,
+        top_k: int = 5
+    ) -> dict:
+
+        # 1. Hybrid Retrieval + Cross-Encoder Reranking
         retrieved_chunks, reranked_chunks = self.retriever_reranker(
             query=query,
             per_retriever_k=per_retriever_k
         )
 
-        # 2. 从重排结果里筛真正用于回答的证据
-        evidence_chunks = select_evidence_chunks(retrieved_chunks=reranked_chunks,
-                                                 threshold=0.9,
-                                                 max_chunks=5)
+        # 正式主链路只向后暴露最终 Top-K，
+        # Query Planner 实验链路 run_low() 仍然保留完整候选，不受这里影响。
+        top_reranked_chunks = reranked_chunks[:top_k]
+
+        # 2. 从最终 Top-K 中筛真正用于生成的 Evidence
+        # threshold=0.9 保留当前项目已有的低证据规则，不在这次整理中改实验参数。
+        evidence_chunks = select_evidence_chunks(
+            retrieved_chunks=top_reranked_chunks,
+            threshold=0.7,
+            max_chunks=top_k
+        )
 
         results = {
-            "query":query,
-            "retrieved_chunks":retrieved_chunks,
-            "reranked_chunks":reranked_chunks,
-            "evidence_chunks":evidence_chunks
+            "query": query,
+            "retrieved_chunks": retrieved_chunks,
+            "reranked_chunks": top_reranked_chunks,
+            "evidence_chunks": evidence_chunks
         }
 
-        # 3. 只做检索评测，不生成答案
-        if self.generator == None: 
-            # 不需要让decoder-only回答，在评测retriever reranker时，不需要回答
+        # 3. 只做检索评测时，不生成答案
+        if self.generator is None:
             return results
 
-        else:
-            # 4. 没有足够证据，直接拒答
-            if not evidence_chunks:
+        refusal_answer = "根据当前提供的资料，无法确定。"
 
-                results["answer"] = "根据当前提供的资料，无法确定。"
-                results["used_citation"] = []
-                results["refused"] = True
+        # 4. 没有足够 Evidence，直接拒答
+        if not evidence_chunks:
 
-                return results
+            results["answer"] = refusal_answer
+            results["used_citation"] = []
+            results["refused"] = True
+            results["citation_repaired"] = False
+            results["citation_validation_failed"] = False
 
-            # 5. 只把 evidence_chunks 给大语言模型
-            prompt,citation_source = build_rag_prompt(query=query,
-                                                      evidence_chunks=evidence_chunks)
+            return results
 
-            '''切片后的答案：...银行不再补扣。[资料1]'''
-            answer = self.generator.generate(prompt=prompt,
-                                             max_new_tokens=256)
-            
-            # 6. 提取模型真正引用的资料
-            used_citation = self.extract_used_citation(
-                answer=answer,
-                citation_sources=citation_source
+        # 5. 对每个 Evidence 单独生成一条结论，由程序绑定其引用编号。
+        citation_sources = build_citation_sources(evidence_chunks)
+        cited_conclusions = []
+        seen_conclusions = set()
+
+        for evidence_chunk, citation_source in zip(
+            evidence_chunks,
+            citation_sources
+        ):
+
+            prompt = build_single_evidence_prompt(
+                query=query,
+                evidence_chunk=evidence_chunk
             )
 
-            results['answer'] = answer
-            results['used_citation'] = used_citation
-            results["refused"] = False
-            '''{
-                "query":query,
-                "retrieved_chunks":retrieved_chunks,
-                "answer":answer,
-                "'citation_source'":'citation_source'各个回答依据chunk的来源
-            }'''
+            raw_answer = self.generator.generate(
+                prompt=prompt,
+                max_new_tokens=256
+            )
+
+            conclusion = self.parse_single_evidence_answer(raw_answer)
+
+            if conclusion is None:
+                continue
+
+            if not conclusion.endswith("。"):
+                conclusion = f"{conclusion}。"
+
+            if conclusion in seen_conclusions:
+                continue
+
+            seen_conclusions.add(conclusion)
+
+            if len(cited_conclusions) < 3:
+                cited_conclusions.append(
+                    f"{conclusion}{citation_source['citation_id']}"
+                )
+
+        # 6. 所有 Evidence 都没有产生有效结论时，标准拒答。
+        if not cited_conclusions:
+
+            results["answer"] = refusal_answer
+            results["used_citation"] = []
+            results["refused"] = True
+            results["citation_repaired"] = False
+            results["citation_validation_failed"] = False
 
             return results
+
+        answer = "\n".join(cited_conclusions)
+
+        # 7. 程序注入后仍执行现有最终 citation 校验，失败则 fail closed。
+        citation_is_valid = self.validate_answer_citations(
+            answer=answer,
+            citation_sources=citation_sources
+        )
+
+        if not citation_is_valid:
+
+            results["answer"] = refusal_answer
+            results["used_citation"] = []
+            results["refused"] = True
+            results["citation_repaired"] = False
+            results["citation_validation_failed"] = True
+
+            return results
+
+        # 8. 记录最终答案真正使用到的来源
+        used_citation = self.extract_used_citation(
+            answer=answer,
+            citation_sources=citation_sources
+        )
+
+        results["answer"] = answer
+        results["used_citation"] = used_citation
+        results["refused"] = (
+            answer.strip() == refusal_answer
+        )
+        results["citation_repaired"] = False
+        results["citation_validation_failed"] = False
+
+        return results
